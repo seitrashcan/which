@@ -1,0 +1,366 @@
+// This file is part of a project that is licensed under Apache-2.0.
+// See `LICENSE` for details.
+
+#pragma once
+
+#include <cassert>
+#include <type_traits>
+#include <utility>
+#include <variant>
+
+namespace mhx {
+
+inline namespace v1 {
+
+namespace detail {
+
+// `unit` is the internal substitute for `void`. It allows `which<void, E>` to
+// be stored inside `std::variant` without a `void` specialization.
+struct unit {};
+
+// `ok_tag` and `err_tag` are disambiguation tags for the private constructors.
+// They prevent the compiler from confusing which alternative is being
+// constructed when `T` and `E` are the same type.
+struct ok_tag  {};
+struct err_tag {};
+
+// `storage_t` maps `void` to `unit` and leaves all other types unchanged.
+template<typename T>
+using storage_t = std::conditional_t<std::is_void_v<T>, unit, T>;
+
+} // namespace detail
+
+
+/// @brief Tagged union representing the outcome of a fallible operation.
+///
+/// @description
+///   Exactly one of `T` (success) or `E` (error) is active at construction
+///   time. The primary interface is structured bindings:
+///
+///   ```cpp
+///   auto [val, err] = parse(input);
+///   if (err) { handle(*err); return; }
+///   use(*val);
+///   ```
+///
+///   Both `val` and `err` are pointers. Exactly one is non-null. The caller
+///   checks before dereferencing, which is the same discipline as any other
+///   nullable handle in C++.
+///
+///   `which<>` is never reassigned. Move and copy construction propagate
+///   naturally from `T` and `E`. Assignment is deleted to prevent the
+///   `std::variant` `valueless_by_exception` state, which arises when a move
+///   assignment switches the active alternative and the move constructor
+///   throws. Since `which<>` is produced once and consumed once, reassignment
+///   has no legitimate use.
+///
+///   Accessing the wrong alternative is undefined behavior in release builds,
+///   guarded by `assert()` in debug builds. This is the same contract as
+///   `operator[]` on standard containers.
+///
+///   `void` is supported as `T`. Callers write `which<void, E>` and get
+///   sensible behavior without a separate specialization. On success the
+///   structured binding yields a non-null `unit*`; callers only need to check
+///   `err` for null and can ignore `val` entirely.
+///
+/// @tparam T  Success type. May be `void`.
+/// @tparam E  Error type. Must not be `void` or a reference.
+template<typename T, typename E>
+class [[nodiscard]] which {
+    static_assert(!std::is_void_v<E>,
+        "which<T, E>: E must not be void. "
+        "Use a dedicated error type or std::monostate.");
+
+    static_assert(!std::is_reference_v<T> && !std::is_reference_v<E>,
+        "which<T, E>: reference types are not supported.");
+
+    using value_store = detail::storage_t<T>;
+    using storage     = std::variant<value_store, E>;
+
+    storage data;
+
+    // Private constructors delegate construction to the `std::variant` with an
+    // explicit tag so the correct alternative is always unambiguous, even
+    // when `T` and `E` are the same type.
+    explicit which(detail::ok_tag,  value_store&& v) : data(std::in_place_index<0>, std::move(v)) {}
+    explicit which(detail::err_tag, E&&           e) : data(std::in_place_index<1>, std::move(e)) {}
+
+    explicit which(detail::ok_tag,  const value_store& v) : data(std::in_place_index<0>, v) {}
+    explicit which(detail::err_tag, const E&           e) : data(std::in_place_index<1>, e) {}
+
+public:
+
+    // [which.ctor]
+
+    which()                        = delete;
+    which(const which&)            = default;
+    which(which&&)                 = default;
+    which& operator=(const which&) = delete;
+    which& operator=(which&&)      = delete;
+
+    /// @brief  Construct a successful `which<T, E>` holding `val`.
+    ///
+    /// @description
+    ///   This overload is only available when `T` is not `void`. For
+    ///   `which<void, E>`, use the zero-argument `ok()`.
+    ///
+    ///   ```cpp
+    ///   auto w = which<int, std::string>::ok(42);
+    ///   ```
+    ///
+    /// @param val  Value to store. Forwarded into the internal storage.
+    /// @return     A `which<T, E>` with the success alternative active.
+    template<typename U = T, typename = std::enable_if_t<!std::is_void_v<U>>>
+    [[nodiscard]] static which ok(U&& val) {
+        return which(detail::ok_tag{}, std::forward<U>(val));
+    }
+
+    /// @brief  Construct a successful `which<void, E>`.
+    ///
+    /// @description
+    ///   This overload is only available when `T` is `void`.
+    ///
+    ///   ```cpp
+    ///   auto w = which<void, std::string>::ok();
+    ///   ```
+    ///
+    /// @return  A `which<void, E>` with the success alternative active.
+    template<typename U = T, typename = std::enable_if_t<std::is_void_v<U>>>
+    [[nodiscard]] static which ok() {
+        return which(detail::ok_tag{}, detail::unit{});
+    }
+
+    /// @brief  Construct a failed `which<T, E>` holding `e`.
+    ///
+    /// @description
+    ///   ```cpp
+    ///   auto w = which<int, std::string>::err("something went wrong");
+    ///   ```
+    ///
+    /// @param e  Error value to store. Forwarded into the internal storage.
+    /// @return   A `which<T, E>` with the error alternative active.
+    template<typename F = E>
+    [[nodiscard]] static which err(F&& e) {
+        return which(detail::err_tag{}, std::forward<F>(e));
+    }
+
+    // [which.query]
+
+    /// @brief  Returns `true` if the success alternative is active.
+    /// @return `true` on success, `false` on error.
+    [[nodiscard]] bool is_ok()  const noexcept { return data.index() == 0; }
+
+    /// @brief  Returns `true` if the error alternative is active.
+    /// @return `true` on error, `false` on success.
+    [[nodiscard]] bool is_err() const noexcept { return data.index() == 1; }
+
+    // [which.access]
+    //
+    // Accessing the wrong alternative is undefined behavior. In debug builds
+    // an `assert` fires. In release builds the behavior is that of accessing
+    // an inactive `std::variant` member: undefined.
+
+    /// @brief  Returns a reference to the success value.
+    ///
+    /// @description
+    ///   Undefined behavior if `is_err()`. Asserts in debug builds.
+    ///
+    ///   Prefer structured bindings over direct `value()` calls at call sites
+    ///   that handle both alternatives.
+    ///
+    /// @return  Lvalue reference to the stored `T`.
+    [[nodiscard]] value_store& value() & noexcept {
+        assert(is_ok() && "which<T,E>::value() called on an error result");
+        return *std::get_if<0>(&data);
+    }
+
+    /// @brief  Returns a const reference to the success value.
+    ///
+    /// @description
+    ///   Undefined behavior if `is_err()`. Asserts in debug builds.
+    ///
+    /// @return  Const lvalue reference to the stored `T`.
+    [[nodiscard]] const value_store& value() const& noexcept {
+        assert(is_ok() && "which<T,E>::value() called on an error result");
+        return *std::get_if<0>(&data);
+    }
+
+    /// @brief  Returns an rvalue reference to the success value.
+    ///
+    /// @description
+    ///   Undefined behavior if `is_err()`. Asserts in debug builds.
+    ///
+    /// @return  Rvalue reference to the stored `T`.
+    [[nodiscard]] value_store&& value() && noexcept {
+        assert(is_ok() && "which<T,E>::value() called on an error result");
+        return std::move(*std::get_if<0>(&data));
+    }
+
+    /// @brief  Returns a reference to the error value.
+    ///
+    /// @description
+    ///   Undefined behavior if `is_ok()`. Asserts in debug builds.
+    ///
+    /// @return  Lvalue reference to the stored `E`.
+    [[nodiscard]] E& error() & noexcept {
+        assert(is_err() && "which<T,E>::error() called on a success result");
+        return *std::get_if<1>(&data);
+    }
+
+    /// @brief  Returns a const reference to the error value.
+    ///
+    /// @description
+    ///   Undefined behavior if `is_ok()`. Asserts in debug builds.
+    ///
+    /// @return  Const lvalue reference to the stored `E`.
+    [[nodiscard]] const E& error() const& noexcept {
+        assert(is_err() && "which<T,E>::error() called on a success result");
+        return *std::get_if<1>(&data);
+    }
+
+    /// @brief  Returns an rvalue reference to the error value.
+    ///
+    /// @description
+    ///   Undefined behavior if `is_ok()`. Asserts in debug builds.
+    ///
+    /// @return  Rvalue reference to the stored `E`.
+    [[nodiscard]] E&& error() && noexcept {
+        assert(is_err() && "which<T,E>::error() called on a success result");
+        return std::move(*std::get_if<1>(&data));
+    }
+
+    // [which.ptr]
+
+    /// @brief  Returns a pointer to the success value, or `nullptr` on error.
+    ///
+    /// @description
+    ///   Follows the same convention as `std::optional::operator->`. The
+    ///   result is `nullptr` when the error alternative is active; no assert
+    ///   fires.
+    ///
+    /// @return  Pointer to `T`, or `nullptr`.
+    [[nodiscard]] value_store*       operator->()       noexcept { return std::get_if<0>(&data); }
+
+    /// @brief  Returns a const pointer to the success value, or `nullptr` on error.
+    /// @return  Const pointer to `T`, or `nullptr`.
+    [[nodiscard]] const value_store* operator->() const noexcept { return std::get_if<0>(&data); }
+
+    /// @brief  Dereferences the success value (lvalue).
+    ///
+    /// @description
+    ///   Undefined behavior if `is_err()`. Asserts in debug builds.
+    ///
+    /// @return  Lvalue reference to the stored `T`.
+    [[nodiscard]] value_store& operator*() & noexcept {
+        assert(is_ok() && "which<T,E>::operator*() called on an error result");
+        return *std::get_if<0>(&data);
+    }
+
+    /// @brief  Dereferences the success value (const lvalue).
+    /// @return  Const lvalue reference to the stored `T`.
+    [[nodiscard]] const value_store& operator*() const& noexcept {
+        assert(is_ok() && "which<T,E>::operator*() called on an error result");
+        return *std::get_if<0>(&data);
+    }
+
+    /// @brief  Dereferences the success value (rvalue).
+    /// @return  Rvalue reference to the stored `T`.
+    [[nodiscard]] value_store&& operator*() && noexcept {
+        assert(is_ok() && "which<T,E>::operator*() called on an error result");
+        return std::move(*std::get_if<0>(&data));
+    }
+
+    // [which.conv]
+
+    /// @brief  Contextually converts to `true` if the success alternative is active.
+    ///
+    /// @description
+    ///   Mirrors `std::optional`'s boolean conversion. Useful for quick
+    ///   success checks when the error value is not needed:
+    ///
+    ///   ```cpp
+    ///   if (!w) { return; }
+    ///   ```
+    ///
+    /// @return  `true` on success, `false` on error.
+    [[nodiscard]] explicit operator bool() const noexcept { return is_ok(); }
+
+    // [which.bind]
+    //
+    // Decomposing a `which<T, E>` with `auto [val, err] = w` yields:
+    //   `val` - pointer to `T` (or `unit` for `void T`), non-null on success
+    //   `err` - pointer to `E`, non-null on error
+    //
+    // Exactly one pointer is non-null. Pointers are used rather than
+    // references so that both bindings are valid to declare regardless of
+    // which alternative is active. The caller checks before dereferencing.
+
+    /// @brief  Returns element N for structured binding decomposition.
+    ///
+    /// @description
+    ///   Not intended for direct use. The compiler calls this when a
+    ///   `which<T, E>` is decomposed with structured bindings:
+    ///
+    ///   ```cpp
+    ///   auto [val, err] = parse(input);
+    ///   if (err) { handle(*err); return; }
+    ///   use(*val);
+    ///   ```
+    ///
+    ///   `N == 0` yields a `storage_t<T>*`, non-null on success.
+    ///   `N == 1` yields an `E*`, non-null on error.
+    ///
+    /// @tparam N  Binding index. Must be 0 or 1.
+    /// @return    Pointer to the requested alternative, or `nullptr`.
+    template<std::size_t N>
+    [[nodiscard]] auto get() & noexcept {
+        if constexpr (N == 0) return std::get_if<0>(&data);
+        else                  return std::get_if<1>(&data);
+    }
+
+    /// @brief  Const lvalue overload of `get<N>()` for structured bindings.
+    template<std::size_t N>
+    [[nodiscard]] auto get() const& noexcept {
+        if constexpr (N == 0) return std::get_if<0>(&data);
+        else                  return std::get_if<1>(&data);
+    }
+
+    /// @brief  Rvalue overload of `get<N>()` for structured bindings.
+    ///
+    /// @description
+    ///   When binding from a temporary, the pointers remain valid only for
+    ///   the lifetime of the temporary. Do not let the `which<>` expire
+    ///   before the bound pointers are used.
+    template<std::size_t N>
+    [[nodiscard]] auto get() && noexcept {
+        if constexpr (N == 0) return std::get_if<0>(&data);
+        else                  return std::get_if<1>(&data);
+    }
+};
+
+} // namespace v1
+
+} // namespace mhx
+
+
+// [which.bind.std]
+
+namespace std {
+
+/// @brief  Reports that `which<T, E>` decomposes into 2 elements.
+template<typename T, typename E>
+struct tuple_size<mhx::which<T, E>> : integral_constant<size_t, 2> {};
+
+/// @brief  Element 0 is a pointer to the success value (or `unit` for `void`).
+template<typename T, typename E>
+struct tuple_element<0, mhx::which<T, E>> {
+    using type = mhx::v1::detail::storage_t<T>*;
+};
+
+/// @brief  Element 1 is a pointer to the error value.
+template<typename T, typename E>
+struct tuple_element<1, mhx::which<T, E>> {
+    using type = E*;
+};
+
+} // namespace std
